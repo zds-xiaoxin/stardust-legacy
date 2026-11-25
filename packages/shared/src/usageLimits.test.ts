@@ -23,6 +23,7 @@ import {
   exhaustedUsageWindow,
   paceOf,
   paceRemainingPercent,
+  quotaAccounts,
   usesChatGptSharing,
   resolveNewThreadModelSelection,
 } from "./usageLimits.ts";
@@ -2009,5 +2010,77 @@ describe("ChatGPT sharing presentation", () => {
         auth: { status: "unauthenticated", subscriptionSharing: true },
       }),
     ).toBe(false);
+  });
+});
+
+describe("quotaAccounts for acpRegistry", () => {
+  const acpDriver = ProviderDriverKind.make("acpRegistry");
+  const zcode = provider({
+    instanceId: ProviderInstanceId.make("acpRegistry_zcode"),
+    driver: acpDriver,
+    displayName: "ZCode",
+    auth: { status: "unknown", label: "GLM Coding Plan · Lite" },
+    usageLimits: {
+      checkedAt: "2026-09-03T11:00:00.000Z",
+      windows: [{ ...window, id: "glm:token_5h", usedPercent: 10 }],
+    },
+  });
+  const kimi = provider({
+    instanceId: ProviderInstanceId.make("acpRegistry_kimi"),
+    driver: acpDriver,
+    displayName: "Kimi",
+    auth: { status: "unknown" },
+    usageLimits: {
+      checkedAt: "2026-09-03T11:00:00.000Z",
+      windows: [{ ...window, id: "generic:daily", usedPercent: 20 }],
+    },
+  });
+  const unnamed = provider({
+    instanceId: ProviderInstanceId.make("acpRegistry_unnamed"),
+    driver: acpDriver,
+    displayName: undefined,
+    auth: { status: "unknown" },
+    usageLimits: undefined,
+  });
+
+  const present = (providers: readonly ServerProvider[]) =>
+    new Map([
+      [
+        EnvironmentId.make("env-a"),
+        {
+          entry: { target: { label: "Local" } },
+          connection: { phase: "connected" },
+          serverConfig: { providers },
+        },
+      ],
+    ]);
+
+  it("titles single and multiple acpRegistry instances by displayName with and without usageLimits", () => {
+    const single = quotaAccounts(present([zcode]));
+    expect(single.map((a) => ({ label: a.label, title: a.title }))).toEqual([
+      { label: "ZCode", title: "ZCode" },
+    ]);
+
+    const multiple = quotaAccounts(present([zcode, kimi]));
+    expect(multiple.map((a) => ({ label: a.label, title: a.title }))).toEqual([
+      { label: "ZCode", title: "ZCode" },
+      { label: "Kimi", title: "Kimi" },
+    ]);
+
+    const withoutLimits = quotaAccounts(
+      present([
+        { ...zcode, usageLimits: undefined },
+        { ...kimi, usageLimits: undefined },
+      ]),
+    );
+    expect(withoutLimits.map((a) => ({ label: a.label, title: a.title }))).toEqual([
+      { label: "ZCode", title: "ZCode" },
+      { label: "Kimi", title: "Kimi" },
+    ]);
+
+    const fallbackUnnamed = quotaAccounts(present([unnamed]));
+    expect(fallbackUnnamed.map((a) => ({ label: a.label, title: a.title }))).toEqual([
+      { label: "acpRegistry", title: "acpRegistry" },
+    ]);
   });
 });

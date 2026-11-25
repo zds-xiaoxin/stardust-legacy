@@ -8,6 +8,7 @@ import {
   type CustomModelSetting,
   type ServerProvider,
   type ServerProviderModel,
+  type ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -16,6 +17,7 @@ import * as Clock from "effect/Clock";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
@@ -32,6 +34,8 @@ import { AcpRegistryAdapterV2Driver, type AcpRegistryAdapterV2DriverEnv } from "
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
+import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import {
   defaultProviderContinuationIdentity,
@@ -59,6 +63,7 @@ import {
   listAcpRegistryProviders,
   logoutAcpRegistry,
   probeAcpRegistryConfiguration,
+  probeAcpRegistryUsageLimits,
   setAcpRegistryProvider,
 } from "./probe.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
@@ -296,6 +301,11 @@ function baseSnapshot(
       ? null
       : (resolveOfficialAcpRegistryIconUrl(input.probe?.probe.icon) ??
         officialAcpRegistryIconUrlForAgentId(input.settings.agentId));
+  const supportedUsage =
+    input.probe?.usageStats?.status === "supported" ? input.probe.usageStats : undefined;
+  const authLabel =
+    input.auth.label ??
+    (input.auth.status !== "unauthenticated" ? supportedUsage?.authLabel : undefined);
   return {
     instanceId: input.instanceId,
     driver: DRIVER_KIND,
@@ -308,7 +318,11 @@ function baseSnapshot(
     installed: input.installed,
     version: input.version,
     status: input.settings.enabled ? input.status : "disabled",
-    auth: { ...input.auth, canLogout: input.auth.canLogout ?? false },
+    auth: {
+      ...input.auth,
+      canLogout: input.auth.canLogout ?? false,
+      ...(authLabel !== undefined ? { label: authLabel } : {}),
+    },
     checkedAt: input.checkedAt,
     setup: {
       canInstall: false,
@@ -336,6 +350,7 @@ function baseSnapshot(
         }),
     slashCommands: input.probe?.slashCommands ?? [],
     skills: input.probe?.skills ?? [],
+    ...(supportedUsage !== undefined ? { usageLimits: supportedUsage.usageLimits } : {}),
   };
 }
 
@@ -736,6 +751,96 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             }),
           );
     });
+    const provideAcpManagementServices = <A, E>(
+      effect: Effect.Effect<
+        A,
+        E,
+        | AcpRegistrySupport.AcpRegistryCatalog
+        | ChildProcessSpawner.ChildProcessSpawner
+        | SecureRandom.SecureRandom
+      >,
+    ): Effect.Effect<A, E> => {
+      const provided = effect.pipe(
+        Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(SecureRandom.SecureRandom, random),
+      );
+      return Option.isSome(runtimeCoordinator)
+        ? provided.pipe(
+            Effect.provideService(
+              AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator,
+              runtimeCoordinator.value,
+            ),
+          )
+        : provided;
+    };
+    const usageLimitsSupported = yield* Ref.make(false);
+    const latestUsage = yield* Ref.make<
+      | {
+          readonly usageLimits: ServerProviderUsageLimits;
+          readonly authLabel?: string;
+        }
+      | undefined
+    >(undefined);
+    const applyUsageLimitsDeferred =
+      yield* Deferred.make<ManagedServerProvider["applyUsageLimits"]>();
+    const clearUsageState = Ref.set(usageLimitsSupported, false).pipe(
+      Effect.andThen(Ref.set(latestUsage, undefined)),
+    );
+    const recordSupportedUsage = Effect.fn("AcpRegistryDriver.recordSupportedUsage")(function* (
+      usageLimits: ServerProviderUsageLimits,
+      authLabel: string | undefined,
+    ) {
+      yield* Ref.set(usageLimitsSupported, true);
+      yield* Ref.update(latestUsage, (previous) =>
+        previous === undefined ||
+        Date.parse(usageLimits.checkedAt) >= Date.parse(previous.usageLimits.checkedAt)
+          ? { usageLimits, ...(authLabel !== undefined ? { authLabel } : {}) }
+          : previous,
+      );
+    });
+    const refreshSupportedUsage = Effect.fn("AcpRegistryDriver.refreshSupportedUsage")(function* (
+      provider: ServerProvider,
+    ) {
+      if (
+        !provider.enabled ||
+        !provider.installed ||
+        provider.auth.status === "unauthenticated" ||
+        !(yield* Ref.get(usageLimitsSupported))
+      ) {
+        return provider;
+      }
+      const result = yield* provideAcpManagementServices(
+        probeAcpRegistryUsageLimits({
+          instanceId,
+          settings: effectiveConfig,
+          cwd: host.paths.cwd,
+          environment: providerProbeEnvironment(processEnvironment),
+        }),
+      );
+      if (result.status === "supported") {
+        yield* recordSupportedUsage(result.usageLimits, result.authLabel);
+        return {
+          ...provider,
+          ...(result.authLabel !== undefined
+            ? { auth: { ...provider.auth, label: result.authLabel } }
+            : {}),
+          usageLimits: result.usageLimits,
+        };
+      }
+      if (result.status === "unsupported") {
+        yield* clearUsageState;
+        return provider;
+      }
+      return {
+        ...provider,
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt: result.checkedAt,
+          reason: "probeFailed",
+          ...(result.message ? { message: result.message } : {}),
+        }),
+      };
+    });
     // A local executable's version comes only from probing it, so readiness checks reuse the last report.
     const reportedLocalVersion = yield* Ref.make<string | null>(null);
     const checkProvider = checkAcpRegistryProviderReadiness(readinessInput).pipe(
@@ -750,6 +855,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         ),
       ),
       Effect.flatMap(withLiveRuntimeState),
+      Effect.flatMap(refreshSupportedUsage),
     );
     const enrichProvider = checkAcpRegistryProviderStatus(
       {
@@ -788,9 +894,15 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
           now,
         )
       ) {
+        const currentUsage = yield* Ref.get(latestUsage);
+        const auth =
+          currentUsage?.authLabel !== undefined && cached.provider.auth.status !== "unauthenticated"
+            ? { ...cached.provider.auth, label: currentUsage.authLabel }
+            : cached.provider.auth;
         return {
-          provider: { ...cached.provider, checkedAt: baseSnapshot.checkedAt },
+          provider: { ...cached.provider, checkedAt: baseSnapshot.checkedAt, auth },
           generation: cacheState.generation,
+          fromCache: true,
         };
       }
       const enriched = yield* enrichProvider;
@@ -811,7 +923,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             : current,
         );
       }
-      return { provider: enriched, generation: cacheState.generation };
+      return { provider: enriched, generation: cacheState.generation, fromCache: false };
     });
     const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
     const snapshot = yield* makeManagedServerProvider<
@@ -843,12 +955,33 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
           Effect.flatMap(
             Option.match({
               onNone: () => Effect.void,
-              onSome: ({ provider, generation }) =>
+              onSome: ({ provider, generation, fromCache }) =>
                 liveSnapshotSemaphore.withPermit(
                   Ref.get(enrichmentCache).pipe(
                     Effect.flatMap((current) =>
                       current.generation === generation
-                        ? withLiveRuntimeState(provider).pipe(Effect.flatMap(publishSnapshot))
+                        ? Effect.gen(function* () {
+                            if (
+                              !fromCache &&
+                              provider.usageLimits !== undefined &&
+                              provider.usageLimits.windows.length > 0
+                            ) {
+                              yield* recordSupportedUsage(
+                                provider.usageLimits,
+                                provider.auth.label,
+                              );
+                              const applyUsageLimits =
+                                yield* Deferred.await(applyUsageLimitsDeferred);
+                              yield* applyUsageLimits({
+                                checkedAt: provider.usageLimits.checkedAt,
+                                windows: provider.usageLimits.windows,
+                                ...(provider.auth.label ? { authLabel: provider.auth.label } : {}),
+                                complete: true,
+                              });
+                            }
+                            const liveProvider = yield* withLiveRuntimeState(provider);
+                            yield* publishSnapshot(liveProvider);
+                          })
                         : Effect.void,
                     ),
                   ),
@@ -929,30 +1062,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
           }),
       ),
     );
-
-    const provideAcpManagementServices = <A, E>(
-      effect: Effect.Effect<
-        A,
-        E,
-        | AcpRegistrySupport.AcpRegistryCatalog
-        | ChildProcessSpawner.ChildProcessSpawner
-        | SecureRandom.SecureRandom
-      >,
-    ): Effect.Effect<A, E> => {
-      const provided = effect.pipe(
-        Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.provideService(SecureRandom.SecureRandom, random),
-      );
-      return Option.isSome(runtimeCoordinator)
-        ? provided.pipe(
-            Effect.provideService(
-              AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator,
-              runtimeCoordinator.value,
-            ),
-          )
-        : provided;
-    };
+    yield* Deferred.succeed(applyUsageLimitsDeferred, snapshot.applyUsageLimits);
 
     const clearLiveState = (
       Option.isSome(runtimeCoordinator)
@@ -960,7 +1070,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             .clearLiveConfiguration(instanceId)
             .pipe(Effect.andThen(runtimeCoordinator.value.clearAvailableCommands(instanceId)))
         : Effect.void
-    ).pipe(Effect.andThen(clearLearnedModels));
+    ).pipe(Effect.andThen(clearLearnedModels), Effect.andThen(clearUsageState));
     const controller = yield* AcpRegistryAuth.makeAcpRegistryAuth({
       instanceId,
       settings: effectiveConfig,
@@ -1008,6 +1118,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         : Effect.void
       ).pipe(
         Effect.andThen(clearLearnedModels),
+        Effect.andThen(clearUsageState),
         Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
       ),
       orchestrationAdapter,
@@ -1076,6 +1187,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
             Effect.provideService(SecureRandom.SecureRandom, random),
             Effect.tap(() => confirmedAuthentication.set(false)),
+            Effect.tap(() => clearUsageState),
             Effect.tap(() =>
               liveSnapshotSemaphore.withPermit(
                 invalidateEnrichmentCache.pipe(

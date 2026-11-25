@@ -10,9 +10,11 @@ import {
   type ProviderInstanceId,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
+  type ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -40,6 +42,11 @@ import {
 } from "@t3tools/provider-acp/server/sessionConfig";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import {
+  ACP_ACCOUNT_USAGE_STATS_METHOD,
+  isAcpUsageStatsUnsupportedError,
+  parseAcpUsageStatsResponse,
+} from "./usageLimits.ts";
 
 const MAX_AUTH_METHODS = 32;
 const MAX_MODELS = 256;
@@ -53,6 +60,8 @@ const COMMAND_ADVERTISEMENT_GRACE = "500 millis";
 // settle it in seconds, not milliseconds; commands arrive much sooner.
 const MODEL_ADVERTISEMENT_GRACE = "5 seconds";
 const PROBE_SESSION_DELETE_TIMEOUT = "5 seconds";
+const USAGE_STATS_TIMEOUT = Duration.seconds(5);
+const USAGE_STATS_REFRESH_TIMEOUT = Duration.seconds(15);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const boundedText = (value: string, maximumLength: number): string =>
@@ -382,10 +391,20 @@ export interface AcpRegistryConfigurationProbeInput {
 
 type AcpRegistryManagementInput = AcpRegistryConfigurationProbeInput;
 
+export type AcpRegistryUsageStatsProbeResult =
+  | {
+      readonly status: "supported";
+      readonly usageLimits: ServerProviderUsageLimits;
+      readonly authLabel?: string;
+    }
+  | { readonly status: "unsupported" }
+  | { readonly status: "failed"; readonly checkedAt: string; readonly message?: string };
+
 export interface AcpRegistryConfigurationProbeResult {
   readonly probe: AcpRegistryProbeResult;
   readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
+  readonly usageStats?: AcpRegistryUsageStatsProbeResult;
 }
 
 export type AcpRegistryConfigurationProbe<Requirements = never> = (
@@ -422,6 +441,34 @@ const isolateDeepSeekProbeHistory = Effect.fn("AcpRegistryProbe.isolateDeepSeekP
     };
   },
 );
+
+const probeAcpRuntimeUsageLimits = Effect.fn("AcpRegistryProbe.probeRuntimeUsageLimits")(function* (
+  runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+): Effect.fn.Return<AcpRegistryUsageStatsProbeResult> {
+  const response = yield* runtime
+    .request(ACP_ACCOUNT_USAGE_STATS_METHOD, {})
+    .pipe(Effect.timeoutOption(USAGE_STATS_TIMEOUT), Effect.result);
+  const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  if (Result.isFailure(response)) {
+    if (isAcpUsageStatsUnsupportedError(response.failure)) {
+      return { status: "unsupported" };
+    }
+    return {
+      status: "failed",
+      checkedAt,
+      ...(response.failure.message ? { message: response.failure.message } : {}),
+    };
+  }
+  if (Option.isNone(response.success)) {
+    return {
+      status: "failed",
+      checkedAt,
+      message: "Timed out reading ACP usage limits.",
+    };
+  }
+  const parsed = parseAcpUsageStatsResponse(response.success.value, checkedAt);
+  return parsed.status === "failed" ? { ...parsed, checkedAt } : parsed;
+});
 
 export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeConfiguration")(
   function* (
@@ -579,7 +626,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
         started.sessionSetupResult.models,
       );
 
-      yield* Effect.all(
+      const [, , usageStats] = yield* Effect.all(
         [
           hasInitialModels
             ? Effect.void
@@ -589,6 +636,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
           Deferred.await(commandsAdvertised).pipe(
             Effect.timeoutOption(COMMAND_ADVERTISEMENT_GRACE),
           ),
+          probeAcpRuntimeUsageLimits(runtime),
         ],
         { concurrency: "unbounded" },
       );
@@ -605,6 +653,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
         started,
         commands: yield* Ref.get(commandsRef),
         liveConfiguration,
+        usageStats,
       };
     }).pipe(
       Effect.scoped,
@@ -635,6 +684,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       ),
       slashCommands: result.commands.slashCommands,
       skills: result.commands.skills,
+      usageStats: result.usageStats,
     };
   },
 );
@@ -966,4 +1016,45 @@ export const logoutAcpRegistry = Effect.fn("AcpRegistryProbe.logout")(
       }),
       Effect.mapError((error) => managementFailure("logout", error)),
     ),
+);
+
+export const probeAcpRegistryUsageLimits = Effect.fn("AcpRegistryProbe.probeUsageLimits")(
+  function* (
+    input: AcpRegistryManagementInput,
+  ): Effect.fn.Return<
+    AcpRegistryUsageStatsProbeResult,
+    never,
+    | AcpRegistrySupport.AcpRegistryCatalog
+    | ChildProcessSpawner.ChildProcessSpawner
+    | SecureRandom.SecureRandom
+  > {
+    const attempt = Effect.gen(function* () {
+      const runtime = yield* makeAcpRegistryManagementRuntime(input);
+      yield* runtime.initialize();
+      return yield* probeAcpRuntimeUsageLimits(runtime);
+    }).pipe(Effect.scoped, Effect.timeoutOption(USAGE_STATS_REFRESH_TIMEOUT), Effect.result);
+    const outcome = yield* attempt;
+    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    if (Result.isFailure(outcome)) {
+      if (
+        outcome.failure._tag !== "AcpRegistryOperationError" &&
+        isAcpUsageStatsUnsupportedError(outcome.failure)
+      ) {
+        return { status: "unsupported" };
+      }
+      return {
+        status: "failed",
+        checkedAt,
+        ...(outcome.failure.message ? { message: outcome.failure.message } : {}),
+      };
+    }
+    if (Option.isNone(outcome.success)) {
+      return {
+        status: "failed",
+        checkedAt,
+        message: "Timed out reading ACP usage limits.",
+      };
+    }
+    return outcome.success.value;
+  },
 );

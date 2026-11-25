@@ -54,7 +54,22 @@ import { CursorUsageHint } from "./CursorUsageHint";
 import { useUiText } from "~/i18n/useUiText";
 import { UsageCount } from "./UsageMotion";
 import { readUiLocale } from "~/i18n";
-import { CHATGPT_USAGE_URL, collectLimitAccounts, collectExternalUsageLinks, collectLimitPools, limitPoolId, cursorUsageWindowDetails, displayLimitWindows, type LimitAccount, type LimitPool, type LimitPoolMember, type LimitPoolWindow, paceRemainingPercent, remainingPercent, type ResetCreditChoice } from "@t3tools/shared/usageLimits";
+import {
+  CHATGPT_USAGE_URL,
+  collectLimitAccounts,
+  collectExternalUsageLinks,
+  collectLimitPools,
+  limitPoolId,
+  cursorUsageWindowDetails,
+  displayLimitWindows,
+  type LimitAccount,
+  type LimitPool,
+  type LimitPoolMember,
+  type LimitPoolWindow,
+  paceRemainingPercent,
+  remainingPercent,
+  type ResetCreditChoice,
+} from "@t3tools/shared/usageLimits";
 import { collectLimitNotices, formatResetsIn } from "@t3tools/shared/usageLimitsCopy";
 import type { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { normalizeProviderAccentColor } from "@t3tools/client-runtime/state/provider-instance-display";
@@ -1308,8 +1323,11 @@ function limitsHeadline(
   return { lead: copy("Weekly quota is on track"), detail };
 }
 
-// Claude logins are separate subscriptions; averaging them hides which one is nearly spent.
-const SEPARATE_LIMIT_DRIVERS = [ProviderDriverKind.make("claudeAgent")];
+// Claude logins and ACP Registry agents are separate subscriptions; averaging them hides which one is nearly spent.
+const SEPARATE_LIMIT_DRIVERS = [
+  ProviderDriverKind.make("claudeAgent"),
+  ProviderDriverKind.make("acpRegistry"),
+];
 
 export function UsageLimitsPooled({
   presentations,

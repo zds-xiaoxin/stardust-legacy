@@ -949,6 +949,57 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 });
 `;
 
+const usageFakeAgentSource = `
+import { appendFileSync, readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const { id, method } = JSON.parse(line);
+  if (id === undefined) return;
+  const config = JSON.parse(readFileSync(process.argv[2], "utf8"));
+  if (config.logPath && method !== "session/delete") {
+    appendFileSync(config.logPath, method + "\\n");
+  }
+  if (method === "initialize") {
+    send({
+      id,
+      result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [], agentInfo: { name: "fake-usage", version: "1.0.0" } },
+    });
+  } else if (method === "session/new") {
+    send({
+      id,
+      result: {
+        sessionId: "probe-session",
+        models: {
+          currentModelId: "model-a",
+          availableModels: [
+            { modelId: "model-a", name: "Model A" },
+            { modelId: "model-b", name: "Model B" },
+          ],
+        },
+      },
+    });
+    send({
+      method: "session/update",
+      params: {
+        sessionId: "probe-session",
+        update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+      },
+    });
+  } else if (method === "account/usage_stats") {
+    if (config.mode === "unsupported") {
+      send({ id, error: { code: -32601, message: "Method not found" } });
+    } else if (config.mode === "error") {
+      send({ id, error: { code: -32603, message: "Backend unavailable" } });
+    } else {
+      send({ id, result: config.usageResponse });
+    }
+  } else {
+    send({ id, result: {} });
+  }
+});
+`;
+
 const driverLayer = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
   Layer.provideMerge(AcpRegistryRuntimeCoordinator.layer),
   Layer.provideMerge(IdAllocator.layer),
@@ -1187,5 +1238,192 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
         "model-a:effort,model-b:effort",
       );
     }),
+  );
+
+  it.effect(
+    "discovers account/usage_stats, refreshes lightly, and retains cached bars on failure",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "acp-usage-driver-",
+        });
+        const agentPath = path.join(directory, "agent.mjs");
+        const configPath = path.join(directory, "usage-config.json");
+        const logPath = path.join(directory, "methods.log");
+        yield* fileSystem.writeFileString(agentPath, usageFakeAgentSource);
+        yield* fileSystem.writeFileString(logPath, "");
+        yield* fileSystem.writeFileString(
+          configPath,
+          JSON.stringify({
+            mode: "supported",
+            logPath,
+            usageResponse: {
+              glm: {
+                kind: "success",
+                level: "pro",
+                items: [
+                  { key: "token_5h", label: "5h", usedPercent: 12, leftPercent: 88 },
+                  { key: "token_week", label: "Week", usedPercent: 34, leftPercent: 66 },
+                ],
+              },
+            },
+          }),
+        );
+
+        const instance = yield* AcpRegistryDriver.create({
+          instanceId: identity.instanceId,
+          displayName: "ZCode",
+          enabled: true,
+          environment: [],
+          config: decodeSettings({ source: "local", commandPath: "zcode-acp-server" }),
+        }).pipe(
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+            ...catalogWithInspection({
+              status: "ready",
+              agentId: "zcode-acp-server",
+              version: null,
+              distribution: "local",
+            }),
+            resolve: () =>
+              Effect.succeed({
+                distribution: "local" as const,
+                spawn: { command: process.execPath, args: [agentPath, configPath] },
+              }),
+          }),
+        );
+
+        const waitForUsage = yield* instance.snapshot.streamChanges.pipe(
+          Stream.filter((snapshot) => (snapshot.usageLimits?.windows.length ?? 0) > 0),
+          Stream.runHead,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* instance.snapshot.refresh;
+        const initial = yield* Fiber.join(waitForUsage);
+        expect(Option.isSome(initial)).toBe(true);
+        if (Option.isSome(initial)) {
+          expect(initial.value.auth.label).toBe("GLM Coding Plan · Pro");
+          expect(initial.value.usageLimits?.windows).toEqual([
+            {
+              id: "glm:token_5h",
+              kind: "session",
+              label: "5-hour",
+              usedPercent: 12,
+              windowDurationMins: 300,
+            },
+            {
+              id: "glm:token_week",
+              kind: "weekly",
+              label: "Weekly",
+              usedPercent: 34,
+              windowDurationMins: 10_080,
+            },
+          ]);
+        }
+
+        // Subsequent refresh should run lightweight initialize + account/usage_stats without session/new.
+        yield* fileSystem.writeFileString(logPath, "");
+        yield* fileSystem.writeFileString(
+          configPath,
+          JSON.stringify({
+            mode: "supported",
+            logPath,
+            usageResponse: {
+              glm: {
+                kind: "success",
+                level: "lite",
+                items: [
+                  { key: "token_5h", label: "5h", usedPercent: 58, leftPercent: 42 },
+                  { key: "token_week", label: "Week", usedPercent: 61, leftPercent: 39 },
+                ],
+              },
+            },
+          }),
+        );
+        yield* instance.snapshot.refresh;
+        const refreshed = yield* instance.snapshot.getSnapshot;
+        expect(refreshed.auth.label).toBe("GLM Coding Plan · Lite");
+        expect(
+          refreshed.usageLimits?.windows.find((w) => w.id === "glm:token_5h")?.usedPercent,
+        ).toBe(58);
+        const refreshMethods = (yield* fileSystem.readFileString(logPath))
+          .trim()
+          .split("\n")
+          .filter((line) => line.length > 0);
+        expect(refreshMethods).toContain("initialize");
+        expect(refreshMethods.filter((method) => method !== "initialize")).toEqual([
+          "account/usage_stats",
+        ]);
+
+        // A failed refresh retains the last valid cached bars.
+        yield* fileSystem.writeFileString(configPath, JSON.stringify({ mode: "error", logPath }));
+        yield* instance.snapshot.refresh;
+        const afterError = yield* instance.snapshot.getSnapshot;
+        expect(
+          afterError.usageLimits?.windows.find((w) => w.id === "glm:token_5h")?.usedPercent,
+        ).toBe(58);
+      }),
+  );
+
+  it.effect(
+    "falls back cleanly on -32601 and does not spawn usage checks on subsequent refresh",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "acp-nousage-" });
+        const agentPath = path.join(directory, "agent.mjs");
+        const configPath = path.join(directory, "usage-config.json");
+        const logPath = path.join(directory, "methods.log");
+        yield* fileSystem.writeFileString(agentPath, usageFakeAgentSource);
+        yield* fileSystem.writeFileString(logPath, "");
+        yield* fileSystem.writeFileString(
+          configPath,
+          JSON.stringify({ mode: "unsupported", logPath }),
+        );
+
+        const instance = yield* AcpRegistryDriver.create({
+          instanceId: identity.instanceId,
+          displayName: "Unsupported ACP",
+          enabled: true,
+          environment: [],
+          config: decodeSettings({ source: "local", commandPath: "unsupported-acp" }),
+        }).pipe(
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+            ...catalogWithInspection({
+              status: "ready",
+              agentId: "unsupported-acp",
+              version: null,
+              distribution: "local",
+            }),
+            resolve: () =>
+              Effect.succeed({
+                distribution: "local" as const,
+                spawn: { command: process.execPath, args: [agentPath, configPath] },
+              }),
+          }),
+        );
+
+        const waitForModels = yield* instance.snapshot.streamChanges.pipe(
+          Stream.filter((snapshot) => snapshot.models.some((m) => m.slug === "model-a")),
+          Stream.runHead,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* instance.snapshot.refresh;
+        yield* Fiber.join(waitForModels);
+
+        const initial = yield* instance.snapshot.getSnapshot;
+        expect(initial.status).toBe("ready");
+        expect(initial.usageLimits).toBeUndefined();
+
+        yield* fileSystem.writeFileString(logPath, "");
+        yield* instance.snapshot.refresh;
+        const unsupportedRefreshMethods = (yield* fileSystem.readFileString(logPath))
+          .trim()
+          .split("\n")
+          .filter((line) => line.length > 0);
+        expect(unsupportedRefreshMethods.filter((method) => method !== "initialize")).toEqual([]);
+      }),
   );
 });

@@ -11,7 +11,13 @@ export function limitPoolTitles(pools: readonly LimitPool[]): ReadonlyMap<string
   return new Map(
     pools.map((pool) => {
       const driver = providerClients.get(pool.driver)?.label ?? String(pool.driver);
-      if (pool.id === undefined) return [limitPoolId(pool), driver];
+      if (pool.id === undefined) {
+        const title =
+          pool.driver === "acpRegistry" && pool.accounts.length === 1
+            ? pool.accounts[0]?.displayName?.trim() || driver
+            : driver;
+        return [limitPoolId(pool), title];
+      }
       const ordinal = (ordinals.get(pool.driver) ?? 0) + 1;
       ordinals.set(pool.driver, ordinal);
       const name = pool.accounts[0]?.displayName?.trim();

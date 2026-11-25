@@ -299,6 +299,34 @@ describe("quota topbar data", () => {
       );
       expect(lone.map(limitPoolId)).toEqual(["claudeAgent"]);
     });
+
+    it("gives each acpRegistry agent its own limits card instead of averaging", () => {
+      const zcode = provider({
+        instanceId: ProviderInstanceId.make("acpRegistry_zcode"),
+        driver: ProviderDriverKind.make("acpRegistry"),
+        displayName: "ZCode",
+        auth: { status: "unknown" },
+      });
+      const kimi = provider({
+        instanceId: ProviderInstanceId.make("acpRegistry_kimi"),
+        driver: ProviderDriverKind.make("acpRegistry"),
+        displayName: "Kimi",
+        auth: { status: "unknown" },
+      });
+      const accounts = collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("env"),
+            { entry: { target: { label: "Test" } }, serverConfig: { providers: [zcode, kimi] } },
+          ],
+        ]),
+      );
+      const separate = collectLimitPools(accounts, now, {
+        separateDrivers: [ProviderDriverKind.make("acpRegistry")],
+      });
+      expect(separate.map((pool) => pool.accounts[0]?.displayName)).toEqual(["Kimi", "ZCode"]);
+      expect(new Set(separate.map(limitPoolId)).size).toBe(2);
+    });
   });
 });
 

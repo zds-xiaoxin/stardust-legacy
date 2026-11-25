@@ -1263,7 +1263,8 @@ export function quotaAccounts(presentations: Presentations): readonly QuotaAccou
       account.displayName && !account.displayName.includes("@")
         ? account.displayName
         : (account.plan ?? "");
-    const label = LABELS[account.driver] ?? String(account.driver);
+    const driverLabel = LABELS[account.driver] ?? String(account.driver);
+    const label = LABELS[account.driver] ?? (alias || driverLabel);
     return {
       id: preferenceId(account.key),
       driver: account.driver,
@@ -1273,7 +1274,7 @@ export function quotaAccounts(presentations: Presentations): readonly QuotaAccou
       connected: related.some(([, p]) => p.connection.phase === "connected"),
       failed,
       title: label,
-      name: instanceName(account.displayName, label),
+      name: instanceName(account.displayName, driverLabel),
       instances: account.instances ?? [],
     };
   });
@@ -1298,7 +1299,8 @@ export function quotaAccounts(presentations: Presentations): readonly QuotaAccou
         provider.displayName && !provider.displayName.includes("@")
           ? provider.displayName
           : (provider.auth.label ?? "");
-      const label = LABELS[provider.driver] ?? (alias || String(provider.driver));
+      const driverLabel = LABELS[provider.driver] ?? String(provider.driver);
+      const label = LABELS[provider.driver] ?? (alias || driverLabel);
       accounts.push({
         id: preferenceId(`${environmentId}:${provider.instanceId}`),
         driver: provider.driver,
@@ -1308,7 +1310,7 @@ export function quotaAccounts(presentations: Presentations): readonly QuotaAccou
         connected: p.connection.phase === "connected",
         failed: provider.usageLimits?.unavailable?.reason === "probeFailed",
         title: label,
-        name: instanceName(provider.displayName, label),
+        name: instanceName(provider.displayName, driverLabel),
         instances: [{ environmentId, instanceId: provider.instanceId }],
       });
     }
